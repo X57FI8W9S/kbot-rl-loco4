@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 
 import torch
@@ -253,11 +254,16 @@ def step_advance_margin_reward(
     sensor_cfg: SceneEntityCfg,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
-    """Signed completed-step reward: negative below the minimum, positive toward the speed target."""
+    """Continuous step reward: negative below min_advance, positive toward target_advance."""
     asset = env.scene[asset_cfg.name]
     contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    # Calculate single support for continuous reward
+    contact_time = contact_sensor.data.current_contact_time[:, sensor_cfg.body_ids]
+    in_contact = contact_time > 0.0
+    single_support = torch.sum(in_contact.int(), dim=1) == 1
+
+    # Bookkeeping for touchdowns
     first_contact = contact_sensor.compute_first_contact(env.step_dt)[:, sensor_cfg.body_ids]
-    last_air_time = contact_sensor.data.last_air_time[:, sensor_cfg.body_ids]
     command = env.command_manager.get_command(command_name)
     cmd_vx = torch.clamp(command[:, 0], min=0.0)
     target_advance = torch.clamp(
@@ -280,32 +286,32 @@ def step_advance_margin_reward(
     last_root = torch.where(reset, root_x, last_root)
     last_foot = torch.where(reset, torch.full_like(last_foot, -1), last_foot)
 
-    reward = torch.zeros_like(root_x)
+    # Continuous reward based on root advance since the last touchdown
+    advance = root_x - last_root
+    margin = advance - min_step_advance
+    positive = torch.clamp(
+        margin / torch.clamp(target_advance - min_step_advance, min=1.0e-4),
+        min=0.0,
+        max=1.0,
+    )
+    negative = torch.clamp(margin / max(min_step_advance, 1.0e-6), min=-1.0, max=0.0)
+
+    # Un-gated: remove min_air_time requirement to help the policy find the positive gradient
+    signed = positive + short_step_penalty_scale * negative
+
+    # Reward applies during single support when commanded to move
+    moving = torch.norm(command[:, :2], dim=1) > 0.05
+    reward = signed * single_support.float() * moving.float()
+
+    # State update: reset root reference at every touchdown
     for foot_i in range(first_contact.shape[1]):
         touchdown = first_contact[:, foot_i]
-        alternating = last_foot >= 0
-        alternating &= last_foot != foot_i
-        enough_air = last_air_time[:, foot_i] >= min_air_time
-        valid_event = touchdown & alternating
-
-        advance = root_x - last_root
-        margin = advance - min_step_advance
-        positive = torch.clamp(
-            margin / torch.clamp(target_advance - min_step_advance, min=1.0e-4),
-            min=0.0,
-            max=1.0,
-        )
-        negative = torch.clamp(margin / max(min_step_advance, 1.0e-6), min=-1.0, max=0.0)
-        signed = torch.where(enough_air, positive, torch.zeros_like(positive)) + short_step_penalty_scale * negative
-        reward = torch.where(valid_event, signed, reward)
-
         last_root = torch.where(touchdown, root_x, last_root)
         last_foot = torch.where(touchdown, torch.full_like(last_foot, foot_i), last_foot)
 
-    moving = torch.norm(command[:, :2], dim=1) > 0.05
     setattr(env, last_root_name, last_root)
     setattr(env, last_foot_name, last_foot)
-    return reward * moving.float()
+    return reward
 
 
 def supported_forward_velocity_reward(
@@ -829,6 +835,76 @@ def joint_velocity_l2(
     asset = env.scene[asset_cfg.name]
     joint_vel = asset.data.joint_vel[:, asset_cfg.joint_ids]
     return torch.sum(torch.square(joint_vel), dim=1)
+
+
+def lateral_weight_shift_oscillation_reward(
+    env: ManagerBasedRLEnv,
+    target_hz: float,
+    target_amplitude: float,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Reward lateral root movement that follows a target frequency to force weight shifts."""
+    asset = env.scene[asset_cfg.name]
+    # Current lateral position in root frame (or world Y if we assume forward is X)
+    root_y = asset.data.root_pos_w[:, 1]
+    
+    # Target oscillation: A * sin(2 * pi * f * t)
+    t = env.episode_length_buf * env.step_dt
+    target_y = target_amplitude * torch.sin(2.0 * math.pi * target_hz * t)
+    
+    # Reward for matching the oscillation
+    error = torch.square(root_y - target_y)
+    return torch.exp(-error / (target_amplitude**2))
+
+
+def continuous_swing_clearance_reward(
+    env: ManagerBasedRLEnv,
+    target_z: float,
+    sensor_cfg: SceneEntityCfg,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Continuous shaped reward for swing foot ground clearance."""
+    asset = env.scene[asset_cfg.name]
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    contact_time = contact_sensor.data.current_contact_time[:, sensor_cfg.body_ids]
+    is_swing = contact_time <= 0.0
+
+    # Assume body_ids in asset match sensor body_ids for height calculation
+    foot_z = asset.data.body_pos_w[:, sensor_cfg.body_ids, 2]
+    # Reward for being at or above target_z during swing
+    # Simple linear shape reaching 1.0 at target_z
+    reward = torch.clamp(foot_z / target_z, min=0.0, max=1.0)
+    # Sum over both feet
+    return torch.sum(reward * is_swing.float(), dim=1)
+
+
+def cadence_gated_track_lin_vel_xy_exp(
+    env: ManagerBasedRLEnv,
+    std: float,
+    command_name: str,
+    max_cycle_hz: float,
+    sensor_cfg: SceneEntityCfg,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Standard tracking reward gated by walking cadence to break shuffle exploits."""
+    # 1. Calculate standard exponential velocity tracking reward
+    asset = env.scene[asset_cfg.name]
+    command = env.command_manager.get_command(command_name)
+    lin_vel_error = torch.sum(torch.square(command[:, :2] - asset.data.root_lin_vel_b[:, :2]), dim=1)
+    track_reward = torch.exp(-lin_vel_error / std**2)
+
+    # 2. Calculate cadence gate
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    last_air_time = contact_sensor.data.last_air_time[:, sensor_cfg.body_ids]
+    last_contact_time = contact_sensor.data.last_contact_time[:, sensor_cfg.body_ids]
+    cycle_time = torch.mean(last_air_time + last_contact_time, dim=1)
+    cycle_hz = 1.0 / torch.clamp(cycle_time, min=0.01)
+
+    # Gate: 1.0 if cadence is low, 0.0 if cadence is too high
+    gate = torch.clamp(2.0 - (cycle_hz / max_cycle_hz), min=0.0, max=1.0)
+
+    moving = torch.norm(command[:, :2], dim=1) > 0.05
+    return track_reward * gate * moving.float()
 
 
 def joint_position_l2(

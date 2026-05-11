@@ -1109,7 +1109,39 @@ class KBotForwardFlatV25PoseGaitQualityEnvCfg(KBotForwardFlatV25ScratchPoseWidth
     def __post_init__(self) -> None:
         super().__post_init__()
 
-        self.commands.base_velocity.ranges.lin_vel_x = (0.08, 0.16)
+        self.commands.base_velocity.ranges.lin_vel_x = (0.05, 0.05)
+
+        self.rewards.track_lin_vel_xy_exp.weight = 0.0
+        self.rewards.cadence_gated_track_lin_vel = RewTerm(
+            func=mdp.cadence_gated_track_lin_vel_xy_exp,
+            weight=10.0,
+            params={
+                "std": math.sqrt(0.01),
+                "command_name": "base_velocity",
+                "max_cycle_hz": 4.0,
+                "sensor_cfg": SceneEntityCfg("contact_forces", body_names=["foot1", "foot3"]),
+                "asset_cfg": SceneEntityCfg("robot"),
+            },
+        )
+        self.rewards.lateral_oscillation = RewTerm(
+            func=mdp.lateral_weight_shift_oscillation_reward,
+            weight=10.0,
+            params={
+                "target_hz": 1.0,
+                "target_amplitude": 0.05,
+                "asset_cfg": SceneEntityCfg("robot"),
+            },
+        )
+
+        self.rewards.continuous_swing_clearance = RewTerm(
+            func=mdp.continuous_swing_clearance_reward,
+            weight=1.0,
+            params={
+                "target_z": 0.005,
+                "sensor_cfg": SceneEntityCfg("contact_forces", body_names=["foot1", "foot3"]),
+                "asset_cfg": SceneEntityCfg("robot"),
+            },
+        )
 
         self.rewards.world_forward_velocity_clip.weight = 2.5
         self.rewards.world_forward_velocity_clip.params["max_velocity"] = 0.12
@@ -1144,18 +1176,20 @@ class KBotForwardFlatV25PoseGaitQualityEnvCfg(KBotForwardFlatV25ScratchPoseWidth
         )
         self.rewards.step_advance_margin = RewTerm(
             func=mdp.step_advance_margin_reward,
-            weight=2.0,
+            weight=200.0,
             params={
                 "command_name": "base_velocity",
                 "target_cycle_hz": 1.25,
                 "min_step_advance": 0.020,
                 "max_step_advance": 0.12,
-                "short_step_penalty_scale": 1.5,
+                "short_step_penalty_scale": 5.0,
                 "min_air_time": 0.12,
                 "sensor_cfg": SceneEntityCfg("contact_forces", body_names=["foot1", "foot3"]),
                 "asset_cfg": SceneEntityCfg("robot"),
             },
         )
+        self.rewards.termination_penalty.weight = -2000.0
+        self.rewards.upright_alive.weight = 30.0
         # Future swing-clearance margin target: 0.005 m. No z reward is active in this stage.
         self.rewards.supported_forward_velocity = RewTerm(
             func=mdp.supported_forward_velocity_reward,
